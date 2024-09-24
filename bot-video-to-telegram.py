@@ -1,149 +1,201 @@
-import asyncio
 import logging
 import os
 
 import instaloader
 import yt_dlp as youtube_dl
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.types import InputFile
 from dotenv import load_dotenv
+from telegram import Update
+from telegram.error import NetworkError, TelegramError
+from telegram.ext import (Application, CallbackContext, CommandHandler,
+                          ConversationHandler, MessageHandler, filters)
 
-# Cargar variables de entorno
+# Cargar las variables de entorno desde el archivo .env
 load_dotenv()
-print(InputFile)
 
-# Configuración de logging con fecha y hora
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-
-# Inicializa el bot y el despachador
-API_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+# Token del bot de Telegram y credenciales de Instagram desde .env
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+INSTAGRAM_USERNAME = os.getenv('INSTAGRAM_USERNAME')
+INSTAGRAM_PASSWORD = os.getenv('INSTAGRAM_PASSWORD')
 
 # Carpeta donde se guardarán los videos
 DOWNLOAD_FOLDER = 'telegramBotVideos'
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# Reuse the Instagram downloader session
-L = instaloader.Instaloader(download_video_thumbnails=False, save_metadata=False, download_comments=False)
+# Crear la carpeta si no existe
+if not os.path.exists(DOWNLOAD_FOLDER):
+    os.makedirs(DOWNLOAD_FOLDER)
 
-async def login_instagram():
-    """Función para iniciar sesión en Instagram."""
+# Configuración del logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+
+# Ajustar el nivel de logging para la biblioteca de Telegram
+telegram_logger = logging.getLogger('telegram')
+telegram_logger.setLevel(logging.WARNING)  # Solo mostrará advertencias y errores, no solicitudes de "getUpdates"
+
+
+# Estados de la conversación
+WAITING_FOR_URL = range(1)
+
+# Función para limpiar la carpeta antes de una nueva descarga
+def clean_download_folder():
+    logging.info("Limpiando la carpeta de descargas.")
+    for root, dirs, files in os.walk(DOWNLOAD_FOLDER):
+        for file in files:
+            file_path = os.path.join(root, file)
+            try:
+                os.remove(file_path)
+                logging.info(f"Archivo eliminado: {file_path}")
+            except Exception as e:
+                logging.error(f"Error al eliminar el archivo {file_path}: {e}")
+
+# Función para descargar el video de Instagram
+def download_instagram_video(post_url):
+    clean_download_folder()  # Limpiar la carpeta antes de la descarga
+
+    L = instaloader.Instaloader(
+        download_video_thumbnails=False, 
+        save_metadata=False, 
+        download_comments=False,
+        filename_pattern="{shortcode}"  # Evitar sobrescribir por nombre repetido
+    )
+
+    # Iniciar sesión en Instagram
     try:
-        L.login(os.getenv('INSTAGRAM_USERNAME'), os.getenv('INSTAGRAM_PASSWORD'))
-        logging.info("Login exitoso en Instagram")
-        return True
+        L.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        logging.info("Sesión iniciada correctamente en Instagram.")
     except instaloader.exceptions.BadCredentialsException:
         logging.error("Credenciales de Instagram incorrectas.")
-        return False
+        return None
     except instaloader.exceptions.ConnectionException:
         logging.error("Error de conexión a Instagram.")
-        return False
+        return None
+    except Exception as e:
+        logging.error(f"Error al iniciar sesión en Instagram: {e}")
+        return None
 
-async def download_instagram_video(post_url):
-    """Descargar video de Instagram."""
-    logging.info(f"Descargando video de Instagram desde URL: {post_url}")
     try:
         shortcode = post_url.split("/")[-2]
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         L.download_post(post, target=DOWNLOAD_FOLDER)
-        for root, _, files in os.walk(DOWNLOAD_FOLDER):
+        for root, dirs, files in os.walk(DOWNLOAD_FOLDER):
             for file in files:
                 if file.endswith(".mp4"):
-                    logging.info(f"Video descargado: {file}")
+                    logging.info(f"Video descargado correctamente: {file}")
                     return os.path.join(root, file)
         logging.warning("No se encontró ningún archivo de video en el directorio.")
+        return None
+    except instaloader.exceptions.QueryReturnedBadRequestException:
+        logging.error("Consulta incorrecta a Instagram.")
+        return None
+    except instaloader.exceptions.LoginRequiredException:
+        logging.error("Se requiere inicio de sesión para acceder al contenido de Instagram.")
         return None
     except Exception as e:
         logging.error(f"Error descargando el video de Instagram: {e}")
         return None
 
-async def download_video(url):
-    """Descargar video de Twitter o TikTok."""
-    logging.info(f"Descargando video de URL: {url}")
+# Función para descargar el video de Twitter o TikTok
+def download_video(url):
     try:
         ydl_opts = {
-            'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title).40s.%(ext)s'),
+            'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title).40s.%(ext)s'),  # Guardar en la carpeta videosConverter
             'format': 'best[ext=mp4]',
-            'nocheckcertificate': True,
-            'restrictfilenames': True
+            'nocheckcertificate': True,  # Ignorar verificación de certificado si es necesario
+            'restrictfilenames': True  # Remueve caracteres problemáticos del nombre del archivo
         }
         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
             result = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(result)
-            logging.info(f"Video descargado: {filename}")
+            logging.info(f"Video descargado correctamente: {filename}")
             return filename
     except Exception as e:
         logging.error(f"Error descargando el video: {e}")
         return None
 
-# Comando /start
-@dp.message(F.text.startswith('/start'))
-async def send_welcome(message: types.Message):
-    await message.reply("¡Hola! Envíame la URL de un video de Instagram, Twitter o TikTok para descargarlo.")
+# Comando de inicio
+async def start(update: Update, context: CallbackContext) -> int:
+    user_id = update.message.from_user.id
+    user = update.message.from_user
+    first_name = user.first_name
+    last_name = user.last_name
+    username = user.username
 
-# Manejo de mensajes para links de Instagram, Twitter, TikTok y X.com (Twitter)
-@dp.message(F.text.contains("instagram.com") | 
-            F.text.contains("twitter.com") | 
-            F.text.contains("tiktok.com") | 
-            F.text.contains("x.com"))
-async def handle_message(message: types.Message):
-    post_url = message.text
-    logging.info(f"Recibido mensaje con URL: {post_url}")
-    video_path = None
-
-    if "instagram.com" in post_url:
-        await message.reply('Iniciando descarga de Instagram...')
-        video_path = await download_instagram_video(post_url)
-    elif any(domain in post_url for domain in ["twitter.com", "x.com", "tiktok.com"]):
-        await message.reply('Iniciando descarga de video...')
-        video_path = await download_video(post_url)
+    if last_name is not None:
+        full_name = f"{first_name} {last_name}"
     else:
-        await message.reply('URL no válida. Envíame una URL de Instagram, Twitter o TikTok.')
-        return
+        full_name = first_name
+
+    logging.info(f"El usuario {full_name} ({username}#{user_id}) está utilizando el bot.")
+
+    await update.message.reply_text(
+        'Hola! Por favor, envíame la URL de la publicación de Instagram, Twitter o TikTok para descargar el video.'
+    )
+    logging.info("Esperando URL")
+    return WAITING_FOR_URL
+
+# Manejar mensajes con URL de Instagram, Twitter o TikTok
+async def handle_message(update: Update, context: CallbackContext) -> int:
+    post_url = update.message.text
+    chat_id = update.message.chat_id
+
+    video_path = None
+    if "instagram.com" in post_url:
+        await context.bot.send_message(chat_id=chat_id, text='Iniciando descarga de Instagram...')
+        logging.info(f"Iniciando descarga de Instagram para URL: {post_url}")
+        video_path = download_instagram_video(post_url)
+    elif "twitter.com" in post_url or "x.com" in post_url:
+        await context.bot.send_message(chat_id=chat_id, text='Iniciando descarga de Twitter...')
+        logging.info(f"Iniciando descarga de Twitter para URL: {post_url}")
+        video_path = download_video(post_url)
+    elif "tiktok.com" in post_url:
+        await context.bot.send_message(chat_id=chat_id, text='Iniciando descarga de TikTok...')
+        logging.info(f"Iniciando descarga de TikTok para URL: {post_url}")
+        video_path = download_video(post_url)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text='Estoy esperando una URL válida de Instagram, Twitter o TikTok.')
+        logging.warning(f"URL no válida recibida: {post_url}")
+        return WAITING_FOR_URL
+
     if video_path:
         try:
-            # Convert the relative path to an absolute path
-            absolute_video_path = os.path.abspath(video_path)
-            logging.info(f"Sending video from: {absolute_video_path}")
+            with open(video_path, 'rb') as video_file:
+                await context.bot.send_video(chat_id=chat_id, video=video_file)
+            await context.bot.send_message(chat_id=chat_id, text='Aquí está tu video.')
+            logging.info(f"Video enviado correctamente a {chat_id}.")
+        except (NetworkError, TelegramError) as e:
+            await context.bot.send_message(chat_id=chat_id, text=f'Error al enviar el video: {e}')
+            logging.error(f"Error al enviar el video: {e}")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text='No se pudo descargar el video. Por favor, verifica la URL.')
+        logging.error("No se pudo descargar el video. Verificar la URL.")
+    return WAITING_FOR_URL
 
-            # Check if the file exists
-            if os.path.exists(absolute_video_path):
-                logging.info(f"File found: {absolute_video_path}")
+# Cancelar la conversación
+async def cancel(update: Update, context: CallbackContext) -> int:
+    await update.message.reply_text('Operación cancelada.')
+    logging.info("Operación cancelada por el usuario.")
+    return ConversationHandler.END
 
-                # Open the file explicitly and pass as InputFile
-                with open(absolute_video_path, 'rb') as video_file:
-                    logging.info(f"File opened successfully: {absolute_video_path}")
-                    
-                    # Wrap the file object in InputFile
-                    video = types.InputFile(video_file, filename=os.path.basename(absolute_video_path))
-                    
-                    # Send the file as a document
-                    await bot.send_document(chat_id=message.chat.id, document=video)
+# Configurar y ejecutar el bot
+def main() -> None:
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-                os.remove(absolute_video_path)  # Clean up after sending
-            else:
-                logging.error(f"File not found: {absolute_video_path}")
-                await message.reply("No se pudo encontrar el archivo de video.")
-        except Exception as e:
-            logging.error(f"Exception when sending video: {e}")
-            await message.reply(f'Error al enviar el video: {e}')
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            WAITING_FOR_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+            ]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
 
+    application.add_handler(conv_handler)
+    logging.info("Bot iniciado y esperando mensajes.")
+    application.run_polling()
 
-# Manejo de todos los demás mensajes no filtrados
-@dp.message()
-async def handle_unhandled_message(message: types.Message):
-    logging.warning(f"Mensaje no manejado: {message.text}")
-    await message.reply("No pude procesar el mensaje. Por favor, envía una URL válida.")
-
-
-async def main():
-    await dp.start_polling(bot)
-
-if __name__ == '__main__':
-    asyncio.run(main())
-
+if __name__ == "__main__":
+    main()
